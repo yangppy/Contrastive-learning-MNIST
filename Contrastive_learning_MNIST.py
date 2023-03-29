@@ -4,18 +4,20 @@ from keras.datasets import mnist
 from keras.utils import to_categorical
 import keras.backend as K
 from keras import layers
-from keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, Lambda
-from keras.models import Model
 from keras.optimizers import Adam
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
+import matplotlib
+matplotlib.use('TkAgg')
 
 # 定义超参数
-num_classes = 10
-input_shape = (28, 28, 1)
-batch_size = 128
-epoches = 10
-path = 'MNIST_data/'
+num_classes = 10  # 类别数
+input_shape = (28, 28, 1)  # 输入形状
+batch_size = 128  # 批量大小
+epoches = 10  # 轮次
+embedding_dim = 64  # 嵌入维度
+alpha = 0.2
+path = r'D:\新建文件夹\简历项目\使用对比学习对MNIST数据集进行预训练和分类\mnist.npz'
 
 # 加载并预处理数据集
 (x_train, y_train), (x_test, y_test) = mnist.load_data(path)
@@ -24,99 +26,108 @@ path = 'MNIST_data/'
 x_train = x_train.astype("float32") / 255.0
 x_test = x_test.astype("float32") / 255.0
 
-# 将标签进行one-hot编码
-y_train = to_categorical(y_train, num_classes)
-y_test = to_categorical(y_test, num_classes)
 
-# 调整图像维度
-x_train = np.expand_dims(x_train, axis=1)
-x_test = np.expand_dims(x_test, axis=1)
+# 定义损失函数
+# 写成闭包是为了传递alpha的值
+def contrastive_loss(alpha):
+    """
+    :param alpha:表示anchor和negative之间为多少时认为他们不匹配
+    """
+    def loss(y_true, y_pred):
+        anchor, positive, negative = y_pred[:, 0], y_pred[:, 1], y_pred[:, 2]
+        # 计算欧式距离
+        # K.sqrt(K.sum(K.square(a - b), axis=-1, keepdims=True))
+        pos_distance = K.sqrt(K.sum(K.square(anchor - positive), axis=-1))
+        neg_distance = K.sqrt(K.sum(K.square(anchor - negative), axis=-1))
+        return K.mean((1 - y_true) * K.square(pos_distance) +
+                      y_true * K.square(K.maximum(0.0, alpha - neg_distance)))
 
-
-# 定义损失函数tf.keras.losses.Loss
-def contrastive_loss(y_true, y_pred, margin=1):
-    # 计算样本间的欧几里得距离
-    distance = K.sqrt(K.sum(K.square(y_pred[0] - y_pred[1]), axis=-1))
-    # 计算同类别样本对损失
-    loss_same = K.square(distance)
-    # 计算异类别样本对损失
-    loss_diff = K.square(K.maximum(margin - distance, 0))
-    # 计算总损失
-    loss = K.mean((1 - y_true) * loss_same + y_true * loss_diff)
     return loss
 
 
 # 自定义DataGenerator
 class DataGenerator(keras.utils.Sequence):
-    def __init__(self, x, y, batch_size, num_classes):
+    def __init__(self, x, y, batch_size, num_classes, alpha):
         self.x = x
         self.y = y
         self.batch_size = batch_size
         self.num_classes = num_classes
-        self.indices = np.arange(len(self.x))
-        self.on_epoch_end()
+        self.alpha = alpha
 
     def __len__(self):
-        return int(np.floor(len(self.x)) / self.batch_size)
+        return int(np.ceil(len(self.x)) / float(self.batch_size))
 
     def __getitem__(self, index):
-        # 从数据集中随机选择索引
-        indices = np.random.choice(self.indices, size=self.batch_size)
+        batch_x = self.x[index * self.batch_size: (index + 1) * self.batch_size]
+        batch_y = self.y[index * self.batch_size: (index + 1) * self.batch_size]
+        anchor = batch_x
+        positive = np.zeros_like(anchor)
+        negative = np.zeros_like(anchor)
 
-        # 生成正样本和负样本
-        anchor_image = self.x[indices]
-        positive_indices = np.random.choice(self.num_classes, size=self.batch_size)
-        positive_images = np.array([self.x[self.y.argmax(axis=1) == i][j] for i, j in enumerate(positive_indices)])
-        negative_indices = np.random.choice(self.num_classes, size=self.batch_size)
-        negative_images = np.array([self.x[self.y.argmax(axis=1) == i][j] for i, j in enumerate(negative_indices)])
+        for i in range(self.batch_size):
+            pos_idx = np.random.choice(np.where(self.y == batch_y[i])[0])
+            neg_idx = np.random.choice(np.where(self.y != batch_y[i])[0])
+            positive[i] = self.x[pos_idx]
+            negative[i] = self.x[neg_idx]
 
-        # 将图像标签合并到一起
-        x = [anchor_image, positive_images, negative_images]
-        y = np.zeros(self.batch_size)
-
-        return x, y
-
-    def on_epoch_end(self):
-        np.random.shuffle(self.indices)
+        return [anchor, positive, negative], np.zeros((self.batch_size,))
 
 
-# 定义对比学习模型
-def create_base_network(input_shape):
-    input = Input(shape=input_shape)
-    x = Conv2D(32, (3, 3), activation='relu', padding='same')(input)
-    x = MaxPooling2D((2, 2))(x)
-    x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-    x = MaxPooling2D((2, 2))(x)
-    x = Flatten()(x)
-    x = Dense(128, activation='relu')(x)
-    model = Model(input, x)
-    return model
+# 构建模型并训练
+anchor_input = layers.Input(shape=input_shape, name="anchor_input")
+positive_input = layers.Input(shape=input_shape, name="positive_input")
+negative_input = layers.Input(shape=input_shape, name="negative_input")
 
+# 建立编码器
+encoder = keras.Sequential(
+    [
+        layers.Conv2D(32, (3, 3), activation="relu", input_shape=input_shape),
+        layers.MaxPooling2D((2, 2)),
+        layers.Conv2D(64, (3, 3), activation="relu"),
+        layers.MaxPooling2D((2, 2)),
+        layers.Flatten(),
+        layers.Dense(embedding_dim, activation="relu"),
+    ],
+    name="encoder",
+)
 
-# 生成模型
-base_network = create_base_network(input_shape)
-input_a = Input(shape=input_shape)
-input_b = Input(shape=input_shape)
-processed_a = base_network(input_a)
-processed_b = base_network(input_b)
-distance = Lambda(lambda x: K.sqrt(K.sum(K.square(x[0] - x[1]), axis=1, keepdims=True)))([processed_a, processed_b])
-model = Model(inputs=[input_a, input_b], outputs=distance)
-# 编译并训练模型
-train_generator = DataGenerator(x_train, y_train, batch_size, num_classes)
-model.compile(loss=contrastive_loss, optimizer='adam')
-model.fit_generator(train_generator, epochs=epoches, verbose=1)
+# 将锚点，正样本，负样本传入编码器
+encoded_anchor = encoder(anchor_input)
+encoded_positive = encoder(positive_input)
+encoded_negative = encoder(negative_input)
 
-# 预训练结束使用TSNE将图像特征可视化
-# Extract features from the base network for the test set
-test_features = base_network.predict(x_test)
+merged_output = layers.concatenate([encoded_anchor, encoded_positive, encoded_negative], axis=-1, name="merged_layer")
+model = keras.Model(inputs=[anchor_input, positive_input, negative_input], outputs=merged_output, name="triplet_model")
 
-# Apply t-SNE to the features to project them into 2D space
-tsne = TSNE(n_components=2, random_state=42)
-test_tsne = tsne.fit_transform(test_features)
+generator = DataGenerator(x_train.reshape(-1, 28, 28, 1), y_train, batch_size, num_classes, alpha)
 
-# Create a scatter plot of the projected features
-plt.figure(figsize=(10, 10))
-for i in range(10):
-    plt.scatter(test_tsne[y_test == i, 0], test_tsne[y_test == i, 1], label=str(i))
-plt.legend()
+# 编译模型
+model.compile(loss=contrastive_loss(alpha), optimizer=Adam())
+model.fit(generator, epochs=epoches)
+
+# 获取编码器
+encoder = model.get_layer("encoder")
+# 对测试数据进行编码生成向量
+embeddings = encoder.predict(x_test.reshape(-1, 28, 28, 1))
+# 使用t-SNE算法对向量进行降维
+tsne_embeddings = TSNE(n_components=2).fit_transform(embeddings)
+
+# TSNE可视化处理
+plt.scatter(tsne_embeddings[:, 0], tsne_embeddings[:, 1], c=y_test)
 plt.show()
+
+x_train_encoded = encoder.predict(x_train.reshape(-1, 28, 28, 1))
+x_test_encoded = encoder.predict(x_test.reshape(-1, 28, 28, 1))
+
+# 训练MLP层并进行分类
+mlp_model = keras.Sequential([
+    layers.Dense(256, activation="relu", input_shape=(embedding_dim,)),
+    layers.Dense(num_classes, activation="softmax")
+], name="mlp_model")
+
+# 编译并训练MLP
+mlp_model.compile(loss="sparse_categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
+mlp_model.fit(x_train_encoded, y_train, batch_size=batch_size, epochs=epoches, validation_data=(x_test_encoded, y_test))
+
+test_loss, test_acc = mlp_model.evaluate(x_test_encoded, y_test)
+print("Test accuracy:", test_acc)
